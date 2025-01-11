@@ -122,19 +122,40 @@ void profile_matrix_times_vector(int n, OpenCL& opencl) {
           {bandwidth(n*n+n+n, t0, t1), bandwidth(n*n+n+n, t2, t3)});
 }
 
-void profile_matrix_times_matrix(int n) {
+void profile_matrix_times_matrix(int n, OpenCL& opencl) {
     auto a = random_matrix<float>(n,n);
     auto b = random_matrix<float>(n,n);
     Matrix<float> result(n,n), expected_result(n,n);
+
+    opencl.queue.flush();
+    cl::Kernel kernel(opencl.program, "matrix_times_matrix");
+
     auto t0 = clock_type::now();
     matrix_times_matrix(a, b, expected_result);
     auto t1 = clock_type::now();
+
+    cl::Buffer d_a(opencl.queue, begin(a), end(a), true);
+    cl::Buffer d_b(opencl.queue, begin(b), end(b), true);
+    cl::Buffer d_result(opencl.context, CL_MEM_READ_WRITE, result.size()*sizeof(float));
+
+    kernel.setArg(0, d_a);
+    kernel.setArg(1, d_b);
+    kernel.setArg(2, d_result);
+    kernel.setArg(3, n);
+    kernel.setArg(4, cl::Local(n * sizeof(float)));
+    opencl.queue.flush();
+
     auto t2 = clock_type::now();
+    opencl.queue.enqueueNDRangeKernel(kernel, cl::NullRange, cl::NDRange(n), cl::NullRange);
+    opencl.queue.flush();
+
     auto t3 = clock_type::now();
+    cl::copy(opencl.queue, d_result, begin(result), end(result));
+
     auto t4 = clock_type::now();
     // TODO Implement OpenCL version! See profile_vector_times_vector for an example.
     // TODO Uncomment the following line!
-    //verify_matrix(expected_result, result);
+    verify_matrix(expected_result, result, 1e-1f);
     print("matrix-times-matrix",
           {t1-t0,t4-t1,t2-t1,t3-t2,t4-t3},
           {bandwidth(n*n+n*n+n*n, t0, t1), bandwidth(n*n+n*n+n*n, t2, t3)});
@@ -145,7 +166,7 @@ void opencl_main(OpenCL& opencl) {
     print_column_names();
     profile_vector_times_vector(1024*1024*10, opencl);
     profile_matrix_times_vector(1024*10, opencl);
-    profile_matrix_times_matrix(1024);
+    profile_matrix_times_matrix(1024, opencl);
 }
 
 const std::string src = R"(
@@ -168,11 +189,42 @@ kernel void matrix_times_vector(global const float* a,
     result[i] = sum;
 }
 
-kernel void matrix_times_matrix(global float* a,
-                                global float* b,
-                                global float* result) {
-    // TODO: Implement OpenCL version.
+kernel void matrix_times_matrix(
+    global const float* a,
+    global const float* b,
+    global float* result,
+    const int n,
+    local float* b_array
+) {
+    int row = get_global_id(0);
+    int local_id = get_local_id(0);
+    int local_size = get_local_size(0);
+
+    float a_row[1024];
+
+    for (int k = 0; k < n; ++k) {
+        a_row[k] = a[row * n + k];
+    }
+
+    float result_value;
+
+    for (int col = 0; col < n; ++col) {
+        for (int k = local_id; k < n; k += local_size) {
+            b_array[k] = b[k * n + col];
+        }
+
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        result_value = 0.0f;
+        for (int k = 0; k < n; ++k) {
+            result_value += a_row[k] * b_array[k];
+        }
+
+        result[row * n + col] = result_value;
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
 }
+
 )";
 
 int main() {
