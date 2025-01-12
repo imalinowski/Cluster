@@ -67,58 +67,194 @@ struct OpenCL {
     cl::CommandQueue queue;
 };
 
-void profile_reduce(int n) {
+void profile_reduce(int n, OpenCL& opencl) {
     auto a = random_vector<float>(n);
     float result = 0, expected_result = 0;
+    opencl.queue.flush();
+    cl::Kernel kernel(opencl.program, "reduce");
+
     auto t0 = clock_type::now();
     expected_result = reduce(a);
     auto t1 = clock_type::now();
+    Vector<float> v_result(1);
+    cl::Buffer d_a(opencl.queue, begin(a), end(a), true);
+    opencl.queue.finish();
+
     auto t2 = clock_type::now();
+
+    int last_vec_size = n;
+    cl::Buffer current_vec = d_a;
+    for (int vec_size = n/1024; vec_size > 0; vec_size /= 1024) {
+      kernel.setArg(0, current_vec);
+      cl::Buffer d_result(opencl.context, CL_MEM_READ_WRITE, vec_size*sizeof(float));
+      kernel.setArg(1, d_result);
+      kernel.setArg(2, vec_size*1024);
+      opencl.queue.enqueueNDRangeKernel(kernel, cl::NullRange, cl::NDRange(vec_size*1024), cl::NDRange(1024));
+      current_vec = d_result;
+      last_vec_size = vec_size;
+    }
+
+    if (last_vec_size > 1) {
+      kernel.setArg(0, current_vec);
+      cl::Buffer d_result(opencl.context, CL_MEM_READ_WRITE, sizeof(float));
+      kernel.setArg(1, d_result);
+      kernel.setArg(2, last_vec_size);
+      opencl.queue.enqueueNDRangeKernel(kernel, cl::NullRange, cl::NDRange(last_vec_size), cl::NDRange(last_vec_size));
+      current_vec = d_result;
+    }
+
+    opencl.queue.finish();
+
     auto t3 = clock_type::now();
+    cl::copy(opencl.queue, current_vec, begin(v_result), end(v_result));
+    result = v_result[0];
     auto t4 = clock_type::now();
     // TODO Implement OpenCL version! See profile_vector_times_vector for an example.
     // TODO Uncomment the following line!
     //verify_vector(expected_result, result);
+    if (std::abs(expected_result - result) > 1e-6f) {
+        std::cout << "Bad  value expected: " << expected_result << ", actual: " << result << '\n';
+    }
     print("reduce",
           {t1-t0,t4-t1,t2-t1,t3-t2,t4-t3},
           {bandwidth(n*n+n+n, t0, t1), bandwidth(n*n+n+n, t2, t3)});
 }
 
-void profile_scan_inclusive(int n) {
+void profile_scan_inclusive(int n, OpenCL& opencl) {
     auto a = random_vector<float>(n);
     Vector<float> result(a), expected_result(a);
+
+    opencl.queue.flush();
+
+    cl::Kernel kernel(opencl.program, "scan_inclusive");
+    cl::Kernel kernel_finish(opencl.program, "finish_scan_inclusive");
+
     auto t0 = clock_type::now();
     scan_inclusive(expected_result);
     auto t1 = clock_type::now();
+
+    cl::Buffer d_a(opencl.queue, begin(a), end(a), false);
+    opencl.queue.finish();
     auto t2 = clock_type::now();
+
+    int levels[][2] = {{1,1024}, {1024,1024}, {1024 * 1024,10}};
+    for (auto level : levels) {
+        kernel.setArg(0, d_a);
+        kernel.setArg(1, d_a);
+        kernel.setArg(2, level[0]);
+        opencl.queue.enqueueNDRangeKernel(
+            kernel,
+            cl::NullRange,
+            cl::NDRange(n / level[0]),
+            cl::NDRange(level[1])
+        );
+    }
+
+    kernel_finish.setArg(0, d_a);
+    kernel_finish.setArg(1, 1024);
+    opencl.queue.enqueueNDRangeKernel(
+        kernel_finish,
+        cl::NullRange,
+        cl::NDRange(n / 1024 - 1),
+        cl::NullRange
+    );
+
+    opencl.queue.finish();
     auto t3 = clock_type::now();
+
+    cl::copy(opencl.queue, d_a, begin(result), end(result));
     auto t4 = clock_type::now();
-    // TODO Implement OpenCL version! See profile_vector_times_vector for an example.
-    // TODO Uncomment the following line!
-    //verify_vector(expected_result, result);
-    print("scan-inclusive",
-          {t1-t0,t4-t1,t2-t1,t3-t2,t4-t3},
-          {bandwidth(n*n+n*n+n*n, t0, t1), bandwidth(n*n+n*n+n*n, t2, t3)});
+
+    print(
+        "scan-inclusive",
+        {t1 - t0, t4 - t1, t2 - t1, t3 - t2, t4 - t3},
+        {bandwidth(n * n + n * n + n * n, t0, t1), bandwidth(n * n + n * n + n * n, t2, t3)}
+    );
 }
 
 void opencl_main(OpenCL& opencl) {
     using namespace std::chrono;
     print_column_names();
-    profile_reduce(1024*1024*10);
-    profile_scan_inclusive(1024*1024*10);
+    profile_reduce(1024*1024*10, opencl);
+    profile_scan_inclusive(1024*1024*10, opencl);
 }
 
 const std::string src = R"(
-kernel void reduce(global float* a,
-                   global float* b,
-                   global float* result) {
-    // TODO: Implement OpenCL version.
+kernel void reduce(
+    global float* a,
+    global float* result,
+    int n
+) {
+    const int global_id = get_global_id(0);
+    const int local_id = get_local_id(0);
+    const int local_size = get_local_size(0);
+
+    local float group_part[1024];
+
+    if (global_id < n) {
+        group_part[local_id] = a[global_id];
+    } else {
+        group_part[local_id] = 0.0f;
+    }
+
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (int offset = local_size / 2; offset > 0; offset /= 2) {
+        if (local_id < offset) {
+            group_part[local_id] += group_part[local_id + offset];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    if (local_id == 0) {
+        const int group_id = get_group_id(0);
+        result[group_id] = group_part[0];
+    }
 }
 
-kernel void scan_inclusive(global float* a,
-                           global float* b,
-                           global float* result) {
-    // TODO: Implement OpenCL version.
+kernel void scan_inclusive(
+    global float* a,
+    global float* result,
+    int a_step
+) {
+    const int global_id = get_global_id(0);
+    const int local_id = get_local_id(0);
+    const int group_size = get_local_size(0);
+
+    local float group_part[1024];
+
+    if (global_id * a_step >= a_step) {
+        return;
+    }
+
+    group_part[local_id] = a[global_id * a_step];
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (int offset = 1; offset < group_size; offset *= 2) {
+        float temp = 0.0f;
+
+        if (local_id >= offset) {
+            temp = group_part[local_id - offset];
+        }
+
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        group_part[local_id] += temp;
+
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    result[global_id * a_step] = group_part[local_id];
+}
+
+kernel void finish_scan_inclusive(
+    global float*a,
+    int step
+) {
+    const int i = get_global_id(0);
+    for (int p = 0; p < step-1; p++) {
+      a[(i+1)*step + p] += a[(i+1)*step - 1];
+    }
 }
 )";
 
