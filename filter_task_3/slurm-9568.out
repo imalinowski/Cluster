@@ -1,0 +1,5 @@
+make: 'build/filter' is up to date.
+Platform name: NVIDIA CUDA
+Device name: NVIDIA GeForce GTX 1060 6GB
+           function              OpenMP        OpenCL total      OpenCL copy-in       OpenCL kernel     OpenCL copy-out
+             filter              6585us             10011us              4571us               984us              4455us
