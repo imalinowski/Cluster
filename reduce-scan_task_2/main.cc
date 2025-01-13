@@ -223,11 +223,7 @@ kernel void scan_inclusive(
 
     local float group_part[1024];
 
-    if (global_id * a_step >= a_step) {
-        return;
-    }
-
-    group_part[local_id] = a[global_id * a_step];
+    group_part[local_id] = a[(a_step-1) + global_id * a_step];
     barrier(CLK_LOCAL_MEM_FENCE);
 
     for (int offset = 1; offset < group_size; offset *= 2) {
@@ -244,7 +240,7 @@ kernel void scan_inclusive(
         barrier(CLK_LOCAL_MEM_FENCE);
     }
 
-    result[global_id * a_step] = group_part[local_id];
+    result[(a_step-1) + global_id * a_step] = group_part[local_id];
 }
 
 kernel void finish_scan_inclusive(
