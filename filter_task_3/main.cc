@@ -61,30 +61,136 @@ struct OpenCL {
     cl::CommandQueue queue;
 };
 
-void profile_filter(int n) {
+void profile_filter(int n, OpenCL& opencl) {
     auto input = random_std_vector<float>(n);
-    std::vector<float> result, expected_result(n);
-    result.reserve(n);
+    std::vector<float> result(n), expected_result;
+    expected_result.reserve(n);
+    opencl.queue.flush();
+
+    cl::Kernel mask_kernel(opencl.program, "mask");
+    cl::Kernel scan_kernel(opencl.program, "scan_inclusive");
+    cl::Kernel finish_scan_kernel(opencl.program, "finish_scan_inclusive");
+    cl::Kernel scatter_kernel(opencl.program, "scatter");
+
     auto t0 = clock_type::now();
-    filter(input, result, [] (float x) { return x > 0; }); // filter positive numbers
+    filter(input, expected_result, [] (float x) { return x > 0; });
     auto t1 = clock_type::now();
+
+    cl::Buffer d_input(opencl.queue, begin(input), end(input), true);
+    cl::Buffer d_mask(opencl.context, CL_MEM_READ_WRITE, n * sizeof(float));
+    cl::Buffer d_out(opencl.context, CL_MEM_READ_WRITE, n * sizeof(float));
+
+    mask_kernel.setArg(0, d_input);
+    mask_kernel.setArg(1, d_mask);
+    opencl.queue.enqueueNDRangeKernel(mask_kernel, cl::NullRange, cl::NDRange(n), cl::NullRange);
+    opencl.queue.finish();
     auto t2 = clock_type::now();
+
+    scan_kernel.setArg(0, d_mask);
+    scan_kernel.setArg(1, d_mask);
+    scan_kernel.setArg(2, 1);
+    opencl.queue.enqueueNDRangeKernel(scan_kernel, cl::NullRange, cl::NDRange(n), cl::NDRange(1024));
+
+    scan_kernel.setArg(2, 1024);
+    opencl.queue.enqueueNDRangeKernel(scan_kernel, cl::NullRange, cl::NDRange(n / 1024), cl::NDRange(1024));
+
+    finish_scan_kernel.setArg(0, d_mask);
+    finish_scan_kernel.setArg(1, 1024);
+    opencl.queue.enqueueNDRangeKernel(finish_scan_kernel, cl::NullRange, cl::NDRange((n / 1024) - 1), cl::NullRange);
+
+    scatter_kernel.setArg(0, d_input);
+    scatter_kernel.setArg(1, d_mask);
+    scatter_kernel.setArg(2, d_out);
+    opencl.queue.enqueueNDRangeKernel(scatter_kernel, cl::NullRange, cl::NDRange(n), cl::NullRange);
+    opencl.queue.finish();
     auto t3 = clock_type::now();
+
+    cl::copy(opencl.queue, d_out, begin(result), end(result));
+    result.erase(std::remove(result.begin(), result.end(), 0), result.end());
+
     auto t4 = clock_type::now();
-    // TODO Implement OpenCL version! See profile_vector_times_vector for an example.
-    // TODO Uncomment the following line!
-    //verify_vector(expected_result, result);
-    print("filter", {t1-t0,t4-t1,t2-t1,t3-t2,t4-t3});
+
+    verify_vector(expected_result, result);
+
+    print("filter", {t1 - t0, t4 - t1, t2 - t1, t3 - t2, t4 - t3});
 }
 
 void opencl_main(OpenCL& opencl) {
     using namespace std::chrono;
     print_column_names();
-    profile_filter(1024*1024);
+    profile_filter(1024*1024, opencl);
 }
 
 const std::string src = R"(
 // TODO: Create OpenCL kernels.
+kernel void scan_inclusive(
+    global float* a,
+    global float* result,
+    int a_step
+) {
+    const int global_id = get_global_id(0);
+    const int local_id = get_local_id(0);
+    const int group_size = get_local_size(0);
+
+    local float group_part[1024];
+
+    group_part[local_id] = a[(a_step-1) + global_id * a_step];
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (int offset = 1; offset < group_size; offset *= 2) {
+        float temp = 0.0f;
+
+        if (local_id >= offset) {
+            temp = group_part[local_id - offset];
+        }
+
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        group_part[local_id] += temp;
+
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    result[(a_step-1) + global_id * a_step] = group_part[local_id];
+}
+
+kernel void finish_scan_inclusive(
+    global float*a,
+    int step
+) {
+    const int i = get_global_id(0);
+    for (int p = 0; p < step-1; p++) {
+      a[(i+1)*step + p] += a[(i+1)*step - 1];
+    }
+}
+
+kernel void mask(
+    global const float* a,
+    global float* result
+) {
+    const int i = get_global_id(0);
+    result[i] = convert_float(a[i] > 0);
+}
+
+kernel void scatter(
+    global float* a,
+    global float* scanned,
+    global float* out
+) {
+    const int i = get_global_id(0);
+
+    const int current = (int)scanned[i];
+    if (current > 0) {
+        if (i == 0) {
+            out[current - 1] = a[i];
+        } else {
+            const int prev = (int)scanned[i - 1];
+            if (current != prev) {
+                out[current - 1] = a[i];
+            }
+        }
+    }
+}
 )";
 
 int main() {
